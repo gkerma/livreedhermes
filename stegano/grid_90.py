@@ -30,7 +30,7 @@ from typing import List, Tuple, Dict, Optional
 from stegano_lib import (
     load_referents, make_keys,
     apply_orientation, ALPHA_LEN,
-    _encrypt, _decrypt, _byte_to_nibs
+    _encrypt, _decrypt, payload_to_symbols
 )
 
 GRID_SIZE   = 90
@@ -88,10 +88,7 @@ def _collect_positions(sr, sc, ref256, k2, kc):
 def encode_super(grid, message, sk, kb, kc, k2, sr, sc, ref256):
     """Encode un message dans les 54 positions du super-bloc (sr, sc)."""
     payload  = _encrypt(message, sk)
-    nibbles  = []
-    for b in payload:
-        hi, lo = _byte_to_nibs(b)
-        nibbles += [hi, lo]
+    nibbles  = payload_to_symbols(payload)
     positions = _collect_positions(sr, sc, ref256, k2, kc)
     for i, (gr, gc) in enumerate(positions):
         if i >= len(nibbles): break
@@ -136,10 +133,7 @@ def make_grid_90(real_message, real_keys, lure_message, lure_keys, ref256):
 def _encode_stream(grid, message, keys, supers, ref256):
     """Encode un message en stream sur une liste de super-blocs."""
     payload = _encrypt(message, keys['steg_key'])
-    nibbles = []
-    for b in payload:
-        hi, lo = _byte_to_nibs(b)
-        nibbles += [hi, lo]
+    nibbles = payload_to_symbols(payload)
     nib_i = 0
     for i, (sr, sc) in enumerate(supers):
         if nib_i >= len(nibbles): break

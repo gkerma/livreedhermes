@@ -2,7 +2,7 @@
 # AGPL v3 (non-commercial) / Commercial license: anibaledel@gmail.com
 # Geometric constructions: IACR ePrint 2026 (CC BY) — Patent: FR2865054
 """
-Chiffrement de disque — Architecture hybride géométrique + XChaCha20-Poly1305
+Chiffrement de disque — Architecture hybride géométrique + ChaCha20-Poly1305
 La Livrée d'Hermès — Anibal Edelberto Amiot (2026)
 
 ARCHITECTURE (suite à évaluation cryptologique externe) :
@@ -10,25 +10,34 @@ ARCHITECTURE (suite à évaluation cryptologique externe) :
   Couche 1 — Géométrique (La Livrée d'Hermès) :
     Transforme le master_key en clé de session via le SPN géométrique.
     Referent 256 (S-box GF + permutation) + Referent 360 (permutation).
+    Mesuré : la table Ref256 compte 12 288 entrées mais seulement 288
+    permutations distinctes (les positions de chaque forme sont déjà triées
+    dans le référent, donc _perm_from_seq efface l'identité de la forme :
+    seul l'ordre des quadrants compte). Soit ~8 bits, non 13,6.
+    Ref360 : 342 entrées pour 116 permutations distinctes.
     Rôle : diversification de clé par construction géométrique originale.
     NON revendiqué comme chiffrement complet à lui seul.
 
   Couche 2 — Cryptographique standard :
-    XChaCha20-Poly1305 (IETF RFC 8439 + nonce 192 bits).
+    ChaCha20-Poly1305 (IETF RFC 8439, nonce 96 bits — c'est ce que fournit
+    `cryptography`; ce n'est PAS XChaCha20, contrairement à ce qu'indiquaient
+    les versions précédentes de ce fichier).
     Fournit : confidentialité + authentification + intégrité par secteur.
-    Nonce unique par secteur via HKDF depuis nonce global + numéro secteur.
+    Le nonce de 96 bits de chaque secteur est dérivé par HKDF d'un nonce
+    global de 192 bits tiré au hasard par fichier, et la clé change à chaque
+    secteur : la réutilisation de nonce reste hors de portée.
 
 Format de sortie :
   [32B salt KDF][24B nonce global][secteurs chiffrés+auth][32B MAC global]
 
 Propriétés démontrées :
-  - Confidentialité : XChaCha20 (standard, éprouvé)
+  - Confidentialité : ChaCha20-Poly1305 (standard, éprouvé)
   - Authentification : Poly1305 par secteur (16B tag) + HMAC-SHA256 global
   - Diversification géométrique : clé de session dérivée via SPN Ref256+360
   - max_DDT S-box ≤ 4 [Nyberg 1994] — propriété de la couche géométrique
 
 AVERTISSEMENT :
-  La sécurité cryptographique effective repose sur XChaCha20-Poly1305,
+  La sécurité cryptographique effective repose sur ChaCha20-Poly1305,
   algorithme standard éprouvé. Le SPN géométrique est une couche de
   diversification de clé originale, non un chiffrement autonome certifié.
   La résistance globale du SPN comme PRP n'a pas été évaluée formellement.
@@ -52,7 +61,7 @@ def _find_ref(name: str) -> str:
     raise FileNotFoundError(f"{name} introuvable")
 
 SECTOR_SIZE  = 512
-NONCE_SIZE   = 24   # XChaCha20 : 192 bits
+NONCE_SIZE   = 24   # nonce global 192 bits (le nonce AEAD par secteur en fait 96)
 TAG_SIZE     = 16   # Poly1305
 SALT_SIZE    = 32
 MAC_SIZE     = 32   # HMAC-SHA256 global
@@ -244,10 +253,21 @@ def _geo_derive(master_key: bytes, nonce: bytes, sn: int,
 
     return bytes(result)
 
+# ── Clé du MAC global ─────────────────────────────────────────────────────────
+def _mac_key(geo_key: bytes, salt: bytes) -> bytes:
+    """
+    Clé HMAC dédiée, dérivée de la clé passée au KDF — jamais master_key brute.
+    Domaine séparé des clés de session (info distinct).
+    """
+    return HKDF(
+        algorithm=_hashes.SHA256(), length=32, salt=salt,
+        info=b'GeoSPN-global-mac-v2',
+    ).derive(geo_key)
+
 # ── API publique ──────────────────────────────────────────────────────────────
 class GeoSPN:
     """
-    Chiffrement hybride : diversification géométrique + XChaCha20-Poly1305.
+    Chiffrement hybride : diversification géométrique + ChaCha20-Poly1305.
     Authentification par secteur (Poly1305) + globale (HMAC-SHA256).
     """
     def __init__(self, ref256: List[Dict], ref360: List[Dict],
@@ -276,7 +296,7 @@ class GeoSPN:
         """
         Chiffre des données arbitraires.
         Format : [32B salt][24B nonce][secteurs auth-chiffrés][32B HMAC global]
-        Chaque secteur = XChaCha20-Poly1305 avec clé dérivée géométriquement.
+        Chaque secteur = ChaCha20-Poly1305 avec clé dérivée géométriquement.
         """
         salt         = os.urandom(SALT_SIZE)
         global_nonce = os.urandom(NONCE_SIZE)
@@ -301,14 +321,15 @@ class GeoSPN:
                 self.n360, self.n_rounds)
             # Nonce secteur unique
             sector_nonce = self._sector_nonce(global_nonce, s)[:12]  # ChaCha20 = 96 bits
-            # XChaCha20-Poly1305
+            # ChaCha20-Poly1305 (RFC 8439)
             aad = struct.pack('>Q', s) + global_nonce
             enc = ChaCha20Poly1305(session_key).encrypt(
                 sector_nonce, sector, aad)
             ciphertext.extend(enc)
 
         payload = salt + global_nonce + bytes(ciphertext)
-        mac = _hmac.new(master_key, payload, hashlib.sha256).digest()
+        mac = _hmac.new(_mac_key(geo_key, salt), payload,
+                        hashlib.sha256).digest()
         return payload + mac
 
     def decrypt(self, data: bytes, master_key: bytes) -> bytes:
@@ -317,16 +338,22 @@ class GeoSPN:
             raise ValueError("Données trop courtes")
         mac_recv = data[-MAC_SIZE:]
         payload  = data[:-MAC_SIZE]
-        mac_calc = _hmac.new(master_key, payload, hashlib.sha256).digest()
-        if not _hmac.compare_digest(mac_recv, mac_calc):
-            raise ValueError("MAC global invalide — données altérées ou clé incorrecte")
 
         salt         = payload[:SALT_SIZE]
         global_nonce = payload[SALT_SIZE:SALT_SIZE+NONCE_SIZE]
         ciphertext   = payload[SALT_SIZE+NONCE_SIZE:]
 
+        # Le KDF est appliqué AVANT toute vérification : le MAC global est
+        # keyé par une clé dérivée, jamais par master_key brute. Sans cela,
+        # un attaquant hors ligne testerait les passphrases contre le MAC
+        # au coût d'un HMAC (~5 us) au lieu du PBKDF2 300 000 (~200 ms).
         geo_key = hashlib.pbkdf2_hmac(
             'sha256', master_key, salt, iterations=300_000, dklen=32)
+
+        mac_calc = _hmac.new(_mac_key(geo_key, salt), payload,
+                             hashlib.sha256).digest()
+        if not _hmac.compare_digest(mac_recv, mac_calc):
+            raise ValueError("MAC global invalide — données altérées ou clé incorrecte")
 
         # Taille d'un secteur chiffré = SECTOR_SIZE + TAG_SIZE (Poly1305)
         sector_enc_size = SECTOR_SIZE + TAG_SIZE
@@ -356,7 +383,7 @@ class GeoSPN:
         return (
             "Chiffrement hybride : diversification géométrique GeoSPN "
             f"(Ref256+Ref360, {self.n_rounds} tours, max_DDT≤4) "
-            "suivie de XChaCha20-Poly1305 par secteur. "
+            "suivie de ChaCha20-Poly1305 (RFC 8439) par secteur. "
             "Authentification : Poly1305 par secteur + HMAC-SHA256 global. "
             "KDF : PBKDF2-SHA256, 300 000 itérations. "
             "NON revendiqué comme chiffrement autonome certifié ; "
@@ -382,7 +409,7 @@ def passphrase_to_key(passphrase: str,
 
 # ── Démo ──────────────────────────────────────────────────────────────────────
 def demo():
-    print("=== GeoSPN + XChaCha20-Poly1305 — La Livrée d'Hermès ===\n")
+    print("=== GeoSPN + ChaCha20-Poly1305 — La Livrée d'Hermès ===\n")
     print("Architecture : diversification géométrique + chiffrement standard\n")
 
     ref256, ref360 = load_referents()
@@ -419,15 +446,15 @@ def demo():
         print(f"Mauvaise clé : détectée ✓ ({e})")
 
     print(f"\n=== PROPRIÉTÉS ===")
-    print(f"  Confidentialité     : XChaCha20 (RFC 8439)")
+    print(f"  Confidentialité     : ChaCha20-Poly1305 (RFC 8439)")
     print(f"  Auth par secteur    : Poly1305 (16B tag)")
     print(f"  Auth globale        : HMAC-SHA256 (32B)")
     print(f"  KDF                 : PBKDF2-SHA256, 300 000 itérations")
-    print(f"  Nonce global        : os.urandom(24B)")
+    print(f"  Nonce global        : os.urandom(24B), nonce/secteur 12B")
     print(f"  Nonce/secteur       : HKDF(global_nonce, secteur)")
     print(f"  Couche géométrique  : diversification clé via SPN Ref256+Ref360")
     print(f"  max_DDT S-box       : ≤ 4 [Nyberg 1994]")
-    print(f"\n  Sécurité effective  : XChaCha20-Poly1305 (standard éprouvé)")
+    print(f"\n  Sécurité effective  : ChaCha20-Poly1305 (standard éprouvé)")
     print(f"  Apport géométrique  : diversification de clé originale,")
     print(f"                        résistance formelle à évaluer")
 

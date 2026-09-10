@@ -1094,7 +1094,10 @@
   function scCompareBytes(a,b){ for(let i=0;i<a.length;i++){ if(a[i]!==b[i]) return a[i]-b[i]; } return 0; }
 
   async function scGenerateEphemeralKeyPair(){
-    const kp = await crypto.subtle.generateKey({name:'X25519'}, true, ['deriveBits']);
+    // extractable=false : ne s'applique qu'a la cle PRIVEE (la publique reste
+    // exportable par specification). La cle privee ephemere ne doit jamais
+    // pouvoir etre extraite par du code de la page.
+    const kp = await crypto.subtle.generateKey({name:'X25519'}, false, ['deriveBits']);
     const pubRaw = await crypto.subtle.exportKey('raw', kp.publicKey);
     return { keyPair: kp, publicHex: scBytesToHex(new Uint8Array(pubRaw)) };
   }
@@ -1364,17 +1367,46 @@
   // Pour une utilisation sensible en production, préférer la CLI Python.
   // ============================================================
   const VAULT_MAGIC = new Uint8Array([0x53,0x42,0x56,0x54]); // "SBVT"
-  const VAULT_VERSION = 1;
+  const VAULT_VERSION = 2;        // v2 : PBKDF2 salé par le sel du vault
+  const VAULT_VERSION_LEGACY = 1; // v1 : lecture seule (sel applicatif fixe)
   const VAULT_ALG_AESGCM = 2; // convention propre à cette page (1 = xchacha20 côté Python, non utilisé ici)
   const VAULT_HEADER_SIZE = 4+1+1+2+32; // magic+version+algo+réservés+salt
   const VAULT_MAX_MANIFEST_SIZE = 64*1024*1024;   // 64 Mo
   const VAULT_MAX_ENTRY_SIZE    = 512*1024*1024;  // 512 Mo
   const VAULT_MAX_ENTRIES       = 65536;
 
-  async function vaultDeriveMasterKey(passphrase){
+  // CORRECTIF AUDIT : la v1 dérivait la clé maître avec un libellé applicatif
+  // FIXE, identique pour tous les vaults et tous les utilisateurs. Les 300 000
+  // itérations ne coûtaient donc qu'une fois à un attaquant : une seule table
+  // précalculée passphrase -> clé maître ouvrait n'importe quel vault. Le
+  // format embarquait pourtant déjà un sel aléatoire de 32 octets dans son
+  // en-tête (offset 8), utilisé pour les sous-clés HKDF ; la v2 s'en sert
+  // aussi pour PBKDF2, ce qui rend tout précalcul propre à un seul fichier.
+  // Aucun sel à conserver à part : il reste lu dans l'en-tête du vault.
+  async function vaultDeriveMasterKey(passphrase, salt){
+    if(!(salt instanceof Uint8Array) || salt.length !== 32){
+      throw new Error('Sel de vault invalide.');
+    }
+    const keyMat = await crypto.subtle.importKey('raw', new TextEncoder().encode(passphrase), {name:'PBKDF2'}, false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({name:'PBKDF2', salt, iterations:300000, hash:'SHA-256'}, keyMat, 256);
+    return new Uint8Array(bits);
+  }
+  // Vaults v1 déjà créés : même dérivation qu'avant, en lecture seule. Un
+  // vault v1 rouvert est ré-exporté en v2 (donc salé) au prochain export.
+  async function vaultDeriveMasterKeyLegacy(passphrase){
     const keyMat = await crypto.subtle.importKey('raw', new TextEncoder().encode(passphrase), {name:'PBKDF2'}, false, ['deriveBits']);
     const bits = await crypto.subtle.deriveBits({name:'PBKDF2', salt: new TextEncoder().encode('SecuBox-Vault-KDF-v1'), iterations:300000, hash:'SHA-256'}, keyMat, 256);
     return new Uint8Array(bits);
+  }
+  // Sel d'un vault existant, lu avant toute dérivation.
+  function vaultReadHeader(bytes){
+    if(bytes.length < VAULT_HEADER_SIZE + 4 + 32) throw new Error('Vault trop court ou corrompu.');
+    for(let i=0;i<4;i++){ if(bytes[i] !== VAULT_MAGIC[i]) throw new Error('Fichier non reconnu (magic invalide).'); }
+    const version = bytes[4];
+    if(version !== VAULT_VERSION && version !== VAULT_VERSION_LEGACY){
+      throw new Error(`Version ${version} non supportée (attendu ${VAULT_VERSION_LEGACY} ou ${VAULT_VERSION}).`);
+    }
+    return { version, algo: bytes[5], salt: bytes.slice(8, 8+32) };
   }
   async function vaultDeriveSubKey(masterKey, salt, infoStr){
     const keyMaterial = await crypto.subtle.importKey('raw', masterKey, 'HKDF', false, ['deriveBits']);
@@ -1420,18 +1452,15 @@
       this.salt = salt;
       this.entries = entries; // Map<name, {data:Uint8Array, sha256:hex, size:number}>
     }
-    static create(masterKey){
-      return new Vault(masterKey, crypto.getRandomValues(new Uint8Array(32)), new Map());
+    static create(masterKey, salt){
+      // Le sel doit être celui qui a servi à dériver masterKey (cf. onVaultNew).
+      return new Vault(masterKey, salt || crypto.getRandomValues(new Uint8Array(32)), new Map());
     }
     static async open(bytes, masterKey){
       if(bytes.length < VAULT_HEADER_SIZE + 4 + 32) throw new Error('Vault trop court ou corrompu.');
       for(let i=0;i<4;i++){ if(bytes[i] !== VAULT_MAGIC[i]) throw new Error('Fichier non reconnu (magic invalide).'); }
-      const version = bytes[4];
-      const algo = bytes[5];
-      if(version !== VAULT_VERSION) throw new Error(`Version ${version} non supportée (attendu ${VAULT_VERSION}).`);
+      const { algo, salt } = vaultReadHeader(bytes);
       if(algo !== VAULT_ALG_AESGCM) throw new Error(`Algorithme ${algo} non supporté par cette page (attendu AES-256-GCM).`);
-
-      const salt = bytes.slice(8, 8+32);
       const macKey = await vaultMacKey(masterKey, salt);
       const macRecv = bytes.slice(bytes.length-32);
       const payload = bytes.slice(0, bytes.length-32);
@@ -1564,8 +1593,9 @@
     const statusEl = document.getElementById('vault-status');
     const pass = document.getElementById('vault-passphrase').value;
     if(!pass){ statusEl.textContent = 'Entre une passphrase.'; return; }
-    const masterKey = await vaultDeriveMasterKey(pass);
-    currentVault = Vault.create(masterKey);
+    const salt = crypto.getRandomValues(new Uint8Array(32));
+    const masterKey = await vaultDeriveMasterKey(pass, salt);
+    currentVault = Vault.create(masterKey, salt);
     document.getElementById('vault-app').hidden = false;
     statusEl.textContent = 'Nouveau vault créé (vide, en mémoire) — ajoute des fichiers puis exporte.';
     vaultRenderList();
@@ -1582,7 +1612,12 @@
     if(!pass){ statusEl.textContent = 'Entre la passphrase du vault avant de l\'ouvrir.'; return; }
     const bytes = new Uint8Array(await input.files[0].arrayBuffer());
     try{
-      const masterKey = await vaultDeriveMasterKey(pass);
+      // Le sel se lit dans l'en-tête AVANT la dérivation (v2) ; les vaults v1
+      // gardent leur dérivation d'origine le temps d'être ré-exportés.
+      const head = vaultReadHeader(bytes);
+      const masterKey = head.version === VAULT_VERSION_LEGACY
+        ? await vaultDeriveMasterKeyLegacy(pass)
+        : await vaultDeriveMasterKey(pass, head.salt);
       currentVault = await Vault.open(bytes, masterKey);
       document.getElementById('vault-app').hidden = false;
       statusEl.textContent = `Vault ouvert : ${input.files[0].name} (${currentVault.list().length} fichier(s)).`;

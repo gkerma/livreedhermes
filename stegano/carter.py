@@ -31,7 +31,8 @@ from cryptography.hazmat.primitives import hashes as _h
 
 from stegano_lib import (
     load_referents, ALPHA_LEN,
-    apply_orientation, _encrypt, _decrypt, _byte_to_nibs
+    apply_orientation, _encrypt, _decrypt,
+    payload_to_symbols, symbols_needed, max_message_for
 )
 
 GRID_SIZE   = 90
@@ -93,8 +94,12 @@ def grammar_stats(grammar: List[Dict]) -> Dict:
         'pure':       roles.count(PURE),
         'structured': roles.count(STRUCTURED),
         'message':    roles.count(MESSAGE),
-        'msg_nibbles': roles.count(MESSAGE) * 6,
-        'msg_bytes':   roles.count(MESSAGE) * 3,
+        'msg_positions': roles.count(MESSAGE) * 6,
+        'msg_chars':     max_message_for(roles.count(MESSAGE) * 6),
+        # Noms d'avant conservés : le flux n'est plus en nibbles, mais des
+        # appelants externes peuvent encore les lire.
+        'msg_nibbles':   roles.count(MESSAGE) * 6,
+        'msg_bytes':     max_message_for(roles.count(MESSAGE) * 6),
     }
 
 # ── Positions d'un bloc selon sa grammaire ────────────────────────────────────
@@ -126,16 +131,16 @@ def encode_carter(
 
     # Vérifier la capacité
     payload  = _encrypt(message, master_key)
-    nibbles  = []
-    for b in payload:
-        hi, lo = _byte_to_nibs(b)
-        nibbles += [hi, lo]
+    # Symboles base-44, même flux que stegano_lib.encode() : les nibbles
+    # [0..15] d'avant trahissaient les cellules message dans un bruit
+    # couvrant [0..43].
+    nibbles  = payload_to_symbols(payload)
 
-    if len(nibbles) > stats['msg_nibbles']:
+    if len(nibbles) > stats['msg_positions']:
         raise ValueError(
-            f"Message trop long : {len(nibbles)//2} bytes > "
-            f"{stats['msg_bytes']} bytes disponibles "
-            f"({stats['message']} blocs message × 6 positions / 2)")
+            f"Message trop long : {len(message)} caractères > "
+            f"{stats['msg_chars']} disponibles "
+            f"({stats['message']} blocs message × 6 positions)")
 
     # Grille de bruit
     grid = [[secrets.randbelow(ALPHA_LEN) for _ in range(GRID_SIZE)]

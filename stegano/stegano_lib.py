@@ -12,8 +12,8 @@ ARCHITECTURE :
              définies par les clés B, C, 2.
 
 NOTE AUDIT : Clé A retirée (redondante avec Clé 2, 0 bit ajouté).
-NOTE AUDIT : Bruit dans [0..ALPHA_LEN-1], nibbles message dans [0..15]
-             → pas de distingueur trivial (0/44).
+NOTE AUDIT : symboles du message ET bruit uniformes sur [0..ALPHA_LEN-1]
+             → aucun distingueur statistique sur la valeur des cellules.
 NOTE AUDIT : Confidentialité assurée par XChaCha20, pas par la géométrie.
 """
 
@@ -50,19 +50,57 @@ def _find_ref(name: str) -> str:
 
 ALPHABET  = ' ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,;:!?-'
 ALPHA_LEN = len(ALPHABET)   # 44
+_AEAD_OVERHEAD = 32 + 24 + 16   # commitment HMAC + nonce XChaCha20 + tag Poly1305
+_MAX_PAYLOAD   = 1 << 24        # garde-fou en-tête (16 Mio)
 
 def load_referents() -> Tuple[List, List]:
     with open(_find_ref('referent_256.json')) as f: r256 = json.load(f)
     with open(_find_ref('referent_360.json')) as f: r360 = json.load(f)
     return r256, r360
 
-# ── Encodage nibbles ──────────────────────────────────────────────────────────
-def _byte_to_nibs(b: int) -> Tuple[int,int]:
-    """Byte → deux nibbles [0..15] ⊂ [0..ALPHA_LEN-1]."""
-    return b >> 4, b & 0xF
+# ── Encodage base-44 ─────────────────────────────────────────────────────────
+# CORRECTIF AUDIT : l'encodage en nibbles plaçait les octets du message dans
+# [0..15] alors que le bruit couvre [0..43]. Toute cellule > 15 était donc
+# prouvablement du bruit, et une forme dont les 6 cellules valent <= 15 avait
+# 1 chance sur 432 d'être du bruit : les blocs porteurs se localisaient
+# statistiquement sans aucune clé. Le message restait chiffré, mais sa
+# PRÉSENCE et son EMPLACEMENT étaient détectables — l'inverse du but d'un
+# système stéganographique.
+#
+# Les symboles portent désormais la même loi uniforme sur [0..ALPHA_LEN-1]
+# que le bruit. Le payload est vu comme un entier, complété par un aléa de
+# rembourrage qui rend la distribution des symboles uniforme à 2^-64 près,
+# puis écrit en base ALPHA_LEN. Bonus : 1,47 symbole par octet au lieu de 2.
 
-def _nibs_to_byte(hi: int, lo: int) -> int:
-    return ((hi & 0xF) << 4) | (lo & 0xF)
+_UNIFORM_MARGIN_BITS = 64   # écart à l'uniformité : <= 2^-64
+
+def _sym_count(nbytes: int) -> int:
+    """Nombre de symboles base-44 pour nbytes octets, marge d'uniformité incluse."""
+    return math.ceil((8*nbytes + _UNIFORM_MARGIN_BITS) / math.log2(ALPHA_LEN))
+
+_SYM_HEADER = _sym_count(4)   # en-tête : longueur du payload sur 4 octets
+
+def _bytes_to_syms(b: bytes, m: int) -> List[int]:
+    """Octets → m symboles uniformes sur [0..ALPHA_LEN-1]."""
+    span = 1 << (8*len(b))
+    k = (ALPHA_LEN ** m) // span
+    if k < 1:
+        raise ValueError(f"{m} symboles insuffisants pour {len(b)} octets")
+    u = int.from_bytes(b, 'big') + span * secrets.randbelow(k)
+    out = []
+    for _ in range(m):
+        u, r = divmod(u, ALPHA_LEN)
+        out.append(r)
+    return out
+
+def _syms_to_bytes(syms: List[int], nbytes: int) -> bytes:
+    """Inverse de _bytes_to_syms : le rembourrage aléatoire disparaît au modulo."""
+    u = 0
+    for d in reversed(syms):
+        if not 0 <= d < ALPHA_LEN:
+            raise ValueError(f"Symbole hors plage : {d}")
+        u = u * ALPHA_LEN + d
+    return (u & ((1 << (8*nbytes)) - 1)).to_bytes(nbytes, 'big')
 
 # ── Chiffrement du message — Key commitment + XChaCha20 ──────────────────────
 import hmac as _hmac_mod
@@ -77,8 +115,9 @@ def _encrypt(message: str, steg_key: bytes) -> bytes:
     """
     Chiffre avec XChaCha20-Poly1305 + key commitment HMAC-SHA256 [correction 3].
 
-    Format : [4B total_size][32B HMAC(commit_key, inner)][inner]
+    Format : [32B HMAC(commit_key, inner)][inner]
       inner = nonce(24) + ciphertext + tag(16)
+    La longueur est portée séparément par l'en-tête base-44 de la grille.
 
     Key commitment : ce ciphertext ne peut déchiffrer valablement
     que sous une seule clé — élimine les partitioning oracle attacks.
@@ -87,23 +126,22 @@ def _encrypt(message: str, steg_key: bytes) -> bytes:
     inner    = _xchacha_enc(steg_key, msg_b)
     ck       = _commit_key(steg_key)
     commit   = _hmac_mod.new(ck, inner, hashlib.sha256).digest()  # 32 bytes
-    payload  = commit + inner
-    return struct.pack('>I', len(payload)) + payload
+    return commit + inner
 
 def _decrypt(vals: List[int], steg_key: bytes) -> str:
     """
     Vérifie le key commitment PUIS déchiffre.
     Double protection : HMAC invalide → rejet immédiat sans tentative de déchiffrement.
     """
-    if len(vals) < 8:
+    if len(vals) < _SYM_HEADER:
         raise ValueError("Grille trop petite")
-    header    = bytes([_nibs_to_byte(vals[i*2], vals[i*2+1]) for i in range(4)])
-    total_len = struct.unpack('>I', header)[0]
-    need      = 8 + total_len * 2
+    total_len = struct.unpack('>I', _syms_to_bytes(vals[:_SYM_HEADER], 4))[0]
+    if total_len > _MAX_PAYLOAD:
+        raise ValueError("En-tête invalide — clé de dissimulation incorrecte")
+    need = _SYM_HEADER + _sym_count(total_len)
     if len(vals) < need:
         raise ValueError(f"Positions insuffisantes : {len(vals)} < {need}")
-    payload   = bytes([_nibs_to_byte(vals[8+i*2], vals[8+i*2+1])
-                       for i in range(total_len)])
+    payload = _syms_to_bytes(vals[_SYM_HEADER:need], total_len)
     if len(payload) < 32:
         raise ValueError("Payload trop court (key commitment manquant)")
     commit_recv, inner = payload[:32], payload[32:]
@@ -117,6 +155,37 @@ def _decrypt(vals: List[int], steg_key: bytes) -> str:
     except Exception:
         raise ValueError("Tag Poly1305 invalide — clé incorrecte ou données altérées")
     return pt.decode('ascii', errors='replace')
+
+# ── Flux de symboles — API pour carter.py et grid_90.py ──────────────────────
+# Ces modules construisent leur propre flux et appellent _decrypt() dessus.
+# Ils doivent donc produire exactement le même flux que encode() : en-tête de
+# longueur puis payload, en symboles base-44. Sans cela, ils continueraient
+# d'écrire des nibbles [0..15] repérables dans un bruit couvrant [0..43].
+
+def payload_to_symbols(payload: bytes) -> List[int]:
+    """Payload chiffré → flux de symboles uniformes sur [0..ALPHA_LEN-1]."""
+    return (_bytes_to_syms(struct.pack('>I', len(payload)), _SYM_HEADER)
+            + _bytes_to_syms(payload, _sym_count(len(payload))))
+
+def symbols_needed(payload_len: int) -> int:
+    """Nombre de positions nécessaires pour un payload de cette taille."""
+    return _SYM_HEADER + _sym_count(payload_len)
+
+def max_payload_for(n_positions: int) -> int:
+    """Plus grand payload (en octets) tenant dans n_positions symboles."""
+    avail = n_positions - _SYM_HEADER
+    if avail <= 0:
+        return 0
+    lo, hi = 0, avail
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _sym_count(mid) <= avail: lo = mid
+        else: hi = mid - 1
+    return lo
+
+def max_message_for(n_positions: int) -> int:
+    """Plus long message clair tenant dans n_positions symboles."""
+    return max(0, max_payload_for(n_positions) - _AEAD_OVERHEAD)
 
 # ── Orientations D4 ──────────────────────────────────────────────────────────
 ORIENTATIONS = [
@@ -157,9 +226,17 @@ def max_message_len(key_b: List[int], grid_size: int = 60) -> int:
         if pos_i >= len(order): break
         available = min(k*k, len(order) - pos_i)
         n_pos += available * 6; pos_i += available
-    n_bytes = n_pos // 2   # 2 nibbles par byte
-    overhead = 4 + 12 + 16  # header + nonce + tag
-    return max(0, n_bytes - overhead)
+    # CORRECTIF AUDIT : l'ancien calcul comptait un surcoût de 32 octets alors
+    # que le format en consomme 72 (32 commitment + 24 nonce + 16 tag). Un
+    # message de la taille annoncée était accepté à l'encodage, tronqué
+    # silencieusement faute de positions, puis irrécupérable au décodage.
+    avail = n_pos - _SYM_HEADER
+    lo, hi = 0, max(0, avail)
+    while lo < hi:                      # plus grand payload tenant dans avail
+        mid = (lo + hi + 1) // 2
+        if _sym_count(mid) <= avail: lo = mid
+        else: hi = mid - 1
+    return max(0, lo - _AEAD_OVERHEAD)
 
 # ── Encodeur ─────────────────────────────────────────────────────────────────
 def encode(message: str, steg_key: bytes,
@@ -174,13 +251,10 @@ def encode(message: str, steg_key: bytes,
         raise ValueError(f"Message trop long : {len(message)} > {max_len}")
 
     payload = _encrypt(message, steg_key)
-    # Convertir en nibbles
-    nibbles = []
-    for b in payload:
-        hi, lo = _byte_to_nibs(b)
-        nibbles.append(hi); nibbles.append(lo)
+    # En-tête (longueur) + payload, en symboles base-44 uniformes
+    nibbles = payload_to_symbols(payload)
 
-    # Grille de bruit — plage complète [0..ALPHA_LEN-1]
+    # Grille de bruit — même loi uniforme [0..ALPHA_LEN-1] que les symboles
     grid = [[secrets.randbelow(ALPHA_LEN) for _ in range(N)] for _ in range(N)]
 
     # Placer les nibbles
